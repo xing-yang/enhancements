@@ -17,7 +17,7 @@ approvers:
   - "@thockin"
 editor: TBD
 creation-date: 2019-05-30
-last-updated: 2019-05-30
+last-updated: 2019-07-30
 status: provisional
 
 ---
@@ -34,9 +34,10 @@ status: provisional
       * [Proposal](#proposal)
       * [Implementation](#implementation)
          * [API change](#api-change)
-         * [Networked volume plugins](#networked-volume-plugins)
-         * [Local storage](#local-storage)
-         * [PV controller changes](#pv-controller-changes)
+         * [CSI change](#csi-change)
+         * [External controller](#external-controller)
+         * [External agent](#external-agent)
+         * [Simple reactions](#simple-reactions)
       * [Implementation History](#implementation-history)
 
 
@@ -44,217 +45,153 @@ status: provisional
 
 For now, kubernetes has no way to monitor PVs, which may cause serious problems. 
 
-For example: if volumes are unhealthy, and pods still try to write data to them, it can lead to data loss or signficantly reduced performance.
+For example: if volumes are unhealthy, and pods still try to write data to them, which will lead to data loss. 
 
 And also if nodes break down, local PVs in the nodes therefore can not be accessed any more. 
 
-So it is necessary to have a mechanism for monitoring PVs.
+So it is necessary to have a mechanism to monitor PVs.
 
 ## User Experience
 
 ### User Cases
 
-#### Local PV
+- If one PV’s volume provisioned by storage driver is deleted, we need to mark the PV to inform users;
 
-- If the local PV directory is deleted, users should know that and the local PV should be tainted;
+- If attaching error occurs, we need to mark the PV too;
 
-- If the local PV path is not a mountpoint any more, the local PV should be tainted;
+- If mounting error occurs, we also need to mark the PV;
 
-- If the node with local PVs in it breaks down, the local PVs should be tainted;
+- If volume errors are detected by other components deployed by users, we need to mark the PV.
 
-- If the volume provisioned by the driver is deleted, the PV object in kubernetes should be tainted;
-
-- If we can not get access to the PV volume for a certain time (network or some other problems), we need to taint the PV;
-
-- PV fsType checking? bad blocks checking?
-
-#### Remote PV
-
-- If the volume provisioned by the driver is deleted, the PV object in kubernetes should be tainted;
-
-- If we can not get access to the PV volume for a certain time (network or some other problems), we need to taint the PV;
-
-- If an attached volume is no longer attached, the PV object should be tainted
-
-- If a mounted volume is not longer mounted, the PV object should be tainted.
-
-- If volume is not usable, e.g., filesystem corruption, bad blocks, etc, the PV object should be tainted.
 
 ## Proposal
 
-In this proposal, we only focus on PV monitoring. 
+In this proposal, we only focus on PV monitoring, reactions are not in the scope. 
 
-API change, local PVs and network PVs monitor are the three main parts we want to discuss here.
+The main architecture is as below:
 
-Regarding the API part, we don’t plan to change PV API object at the first stage, instead we may use the VolumeTaint introduced in [this](https://github.com/kubernetes/enhancements/pull/766) proposal . We propose to create three taints for PV monitoring, details can be found in Implementation section below.
-
-For local PVs, we need to create an **agent** deployed to each node in the cluster to check the local PVs health condition and taint them if necessary.  A local PV monitor **controller** is also needed responsible for watching node failure events and tainting local PVs if nodes break down. BTW: we haven’t support local volumes in Container Storage Interface (CSI), so CSI change is not needed here.
-
-For networked storage, we just need to create a **controller** to check the volumes’ status periodically, and each volume plugin should implement its own health checking methods. 
-Since we are migrating in-tree volume plugins out of tree, the health checking methods should be supported in CSI.
-
-The whole architecture is as below:
 ![pv health monitor architecture](./pv-health-monitor.png)
+
+First of all, i want to note that we divide the PVs health condition checking into three cases
+
+- The health condition checking of PVs themselves, such as if the PV is deleted, if the usage is reaching the threshold...;
+- Attaching conditions checking;
+- Mounting conditions checking.
+
+And in addition, we plan to create a service to receive PV health condition reports from other compoments deployed by users.
+
+Three main parts are involved here in the architecture.
+
+- API change: we plan to introduce a new Taint called PVUnhealthTaint whose key is specific (PVUnhealthMessage) and value can be set differently.
+- External Controller:  responsible for three tasks.
+  - Trigger controller RPC to check the health condition of network PVs themselves for network storage;
+  - Watch for node failure events for both network and local storage;
+  - Create HTTP(RPC) service to receive PVs health condition reports; 
+- External Agent: responsible for two tasks.
+  - Trigger node RPC  to check PVs’ attaching and mounting conditions for network storage;
+     - Since we want to check attaching per node in order to support multi-attach, put attaching check in node RPC here.
+  - Trigger controller and node RPC(when ready) to check local PVs health condition for local storage;
+    - For now, we do not have CSI support for local storage, we may check the local PVs directly by the agent at first, and then move the checks to RPC interfaces when ready.
+
+
 
 
 ## Implementation
 
 ### API change
 
-We plan to introduce three taints for PV health condition.
+We plan to introduce a new Taint called PVUnhealthMessage for PV health condition whose key is specific (PVUnhealthMessage) and value can be set differently. 
 
-**One is `VolumeNotAttached` taint**,
+For example, if the PV is not attached now, we can mark the PV using the PVUnhealthMessage taint like this:
 ```
-Key: VolumeNotAttached 
-Value: true
-VolumeTaintEffect: NoEffect  (Make VolumeTaintEffect non-required field)
-```
-
-If the volume is not attached now, we need to taint the PV using the VolumeNotAttached taint. 
-
-There is already a self-healing feature in-tree that checks if a volume is still attached.  It checks every minute.  If not attached, it tries to attach again. 
-
-If the self-healing controller reattaches successfully, it should remove the VolumeNotAttached taint then. 
-
-In order not to affect the self healing feature, we set the VolumeTaintEffect to NoEffect.
-
-**Another one is `VolumeNotMounted` taint**,
-```
-Key: VolumeNotMounted 
-Value: true
-VolumeTaintEffect: NoEffect  (Make VolumeTaintEffect non-required field)
+Key: “PVUnhealthMessage”
+Value: “AttachError,the pv is not attached to node1 now”
+VolumeTaintEffect: NoEffect
 ```
 
-This can be used for both device mount and volume mount checking. If the volume is not mounted, we need to taint it.
-
-For in use volumes, if the volumes are not mounted, reactions should be taken. 
-
-The reactions needs further discussion, and is not in the scope of this doc. 
-
-For unused volumes, the volume manager will try to mount again when we want to use it, so we do not need any effect.
-
-In summary, we set the VolumeTaintEffect to NoEffect too.
-
-**The last one is: `VolumeNotUsable` taint**,
+If the volume is deleted, we can mark the PV using the PVUnhealthMessage taint like this:
 ```
-Key: VolumeNotUsable (e.g. bad blocks, filesystem corrupted, etc)
-Value: true
-VolumeTaintEffect: NoAttachOrMount
+Key: “PVUnhealthMessage” 
+Value: “VolumeError, the volume is deleted from backend”
+VolumeTaintEffect: NoEffect
 ```
 
-If the volume is not usable because of bad blocks, filesystem corruption, disk deletion or any other reasons, we need to taint the PV using this taint.
+Note that:
 
-Here, we use NoAttachOrMount effect mainly for multi-attach volumes. 
+- all the VolumeTaintEffects are NoEffect now at first, we may talk about the reactions later in another proposal;
+- the taint Value is string now, it is theoretically possible that several errors are detected for one PV, we may extend the string to cover this situation: combine the errors together and splited by semicolon or other symbols.
 
-Because NoAttachOrMount effect will prevent new pods from using the tainted PV. 
 
-And as mentioned above, for in use volumes, reactions are also needed.
+### CSI change
 
-When we finish discussing the reaction for unhealthy PVs, we need to revisit all the VolumeTaintEffects.
+Container Storage Interface (CSI) specification will be modified to add two RPCs ControllerCheckVolume and NodeCheckVolume. 
 
-### Networked storage
-
-For networked storage, the following volume health conditions will be checked:
-* Checks if volume still exists and/or is attached
-* Checks if volume is still mounted and usable
-
-Container Storage Interface (CSI) specification will be modified to add two RPCs ControllerCheckVolume and NodeCheckVolume. A monitor controller (external-monitor) that is responsible for watching the PersistentVolumeClaim, PersistentVolume, and VolumeAttachment API objects will be added. The external-monitor can be deployed as a sidecar container together with the CSI driver.  For PVs, the external-monitor calls CSI driver’s monitor interface to check volume health status.
-
-* ControllerCheckVolume RPC
-  * It calls ControllerCheckVolume() to see if volume still exists; Taints PV with VolumeNotExisting if not existing any more.
-  * If volume is attached, it calls ControllerCheckVolume() to see if volume is still attached; Taints PV with VolumeNotAttached if not attached any more.
-
-* NodeCheckVolume RPC
-  * For any PVC that is mounted, the external-monitor calls NodeCheckVolume() to see if volume is still mounted; Taints PV with VolumeNotMounted if not mounted any more.
-  * Calls NodeCheckVolume to check if volume is usable, e.g., filesystem corruption, bad blocks, etc; Taint PV with VolumeNotUsable if volume is not usable.
+- ControllerCheckVolume RPC
+  - External controller calls ControllerCheckVolume() to check the health condition of PVs themselves, for example, if the PVs are deleted ...
+  - Move Attach checking here ?
+- NodeCheckVolume RPC
+  - If volume is attached to this node, the external agent calls NodeCheckVolume() to see if volume is still attached; Move this check to  ControllerCheckVolume ?
+  - For any PV that is mounted, the external agent calls NodeCheckVolume() to see if volume is still mounted;
+  - Calls NodeCheckVolume to check if volume is usable, e.g., filesystem corruption, bad blocks, etc ?
 
 CSI driver needs to implement the following CSI Controller RPC if CHECK_VOLUME controller capability is supported:
-* ControllerCheckVolume()
+
+- ControllerCheckVolume()
 
 CSI driver also needs to implement the following CSI Node RPC if CHECK_VOLUME node capability is supported:
-* NodeCheckVolume()
+
+- NodeCheckVolume()
 
 The RPC changes needed in the CSI Spec are described in the following.
 
-#### Add ControllerCheckVolume RPC
-
-ControllerCheckVolume RPC checks if volume still exists and/or is still attached if attached already.
-
-Input parameters volume_id and node_id are enough to detect whether a volume is still attached to the same node, but not enough to detect whether the attachment is compatible as before.
-
+##### Add ControllerCheckVolume RPC
+ControllerCheckVolume RPC checks the health condition of PVs themselves, for example if the volume still exists,  if the usage is reaching the threshold and so on.
+Input parameters: volume_id is enough.
 ```
 rpc ControllerCheckVolume (ControllerCheckVolumeRequest)
     returns (ControllerCheckVolumeResponse) {}
 ```
-
 ```
 message ControllerCheckVolumeRequest {
   // The ID of the volume to be used on a node.
   // This field is REQUIRED.
   string volume_id = 1;
-
-  // The ID of the node. This field is REQUIRED. The CO SHALL set this
-  // field to match the node ID returned by `NodeGetInfo`.
-  string node_id = 2;
-
-  // Volume capability describing how the CO intends to use this volume.
-  // SP MUST ensure the CO can use the published volume as described.
-  // Otherwise SP MUST return the appropriate gRPC error code.
-  // This is a OPTIONAL field. (REQUIRED if checking whether attached or not)
-  VolumeCapability volume_capability = 3; (may need this to check if compatible)
-
-  // Indicates SP MUST publish the volume in readonly mode.
-  // CO MUST set this field to false if SP does not have the
-  // PUBLISH_READONLY controller capability.
-  // This is a OPTIONAL field. (REQUIRED if checking whether attached or not)
-  bool readonly = 4; (may need this to check if compatible)
-
-  // Secrets required by plugin to complete controller publish volume
-  // request. This field is OPTIONAL. Refer to the
-  // `Secrets Requirements` section on how to use this field.
-  map<string, string> secrets = 5 [(csi_secret) = true]; (Should not need secrets to check if it is attached, but need secrets to re-attach)
-
-  // Volume context as returned by CO in CreateVolumeRequest. This field
-  // is OPTIONAL and MUST match the volume_context of the volume
-  // identified by `volume_id`.
-  map<string, string> volume_context = 6; (may need this to check if compatible)
 }
 ```
-
 ```
 message ControllerCheckVolumeResponse {
   // Indicate whether the volume exists
   bool exists = 1;
 
-  // Indicate whether the volume is attached
-  bool is_attached = 2;
+  // Indicate the usage of the volume
+  string usage = 2;
+
+// describe the volume health condition
+  string health_condition = 3
 }
 ```
 
-If volume is no longer attached, the monitoring (reaction) controller can trigger the CSI plugin to re-attach which may need secrets.  There are many reasons why the volume is no longer attached.  If it is caused by a network problem, re-attach may not work until the network problem is resolved.  The reaction controller will not be in the scope for the first phase of the volume health proposal.
-
-If volume is still attached but not compatible, it needs admin intervention. Taint the volume, log an event but DO NOT attempt to detach and re-attach.
-
-#### Add NodeCheckVolume RPC
-
-NodeCheckVolume RPC checks if volume is still mounted and usable. To check whether a volume is usable, the CSI driver is supposed to check if filesystem is corrupted, whether there are bad blocks, etc. in this RPC.
-
+##### Add NodeCheckVolume RPC
+NodeCheckVolume RPC checks if volume is still attached, mounted and usable. 
+To check whether a volume is usable, the CSI driver is supposed to check if filesystem is corrupted, whether there are bad blocks, etc. in this RPC.
 ```
 rpc NodeCheckVolume (NodeCheckVolumeRequest)
     returns (NodeCheckVolumeResponse) {}
 ```
-
 ```
 message NodeCheckVolumeRequest {
   // The ID of the volume to check. This field is REQUIRED.
   string volume_id = 1;
 
+// The ID of the node. This field is REQUIRED. The CO SHALL set this
+  // field to match the node ID returned by `NodeGetInfo`.
+  string node_id = 2;
   // The CO SHALL set this field to the value returned by
   // `ControllerPublishVolume` if the corresponding Controller Plugin
   // has `PUBLISH_UNPUBLISH_VOLUME` controller capability, and SHALL be
   // left unset if the corresponding Controller Plugin does not have
   // this capability. This is an OPTIONAL field.
-  map<string, string> publish_context = 2;
+  map<string, string> publish_context = 3;
 
   // The path to which the volume was staged by `NodeStageVolume`.
   // It MUST be an absolute path in the root filesystem of the process
@@ -262,7 +199,7 @@ message NodeCheckVolumeRequest {
   // It MUST be set if the Node Plugin implements the
   // `STAGE_UNSTAGE_VOLUME` node capability.
   // This is an OPTIONAL field.
-  string staging_target_path = 3;
+  string staging_target_path = 4;
 
   // The path to which the volume will be published. It MUST be an
   // absolute path in the root filesystem of the process serving this
@@ -276,87 +213,74 @@ message NodeCheckVolumeRequest {
   // mounted directory at target_path.
   // Creation of target_path is the responsibility of the SP.
   // This is a REQUIRED field.
-  string target_path = 4;
+  string target_path = 5;
 
   // Volume capability describing how the CO intends to use this volume.
   // SP MUST ensure the CO can use the published volume as described.
   // Otherwise SP MUST return the appropriate gRPC error code.
   // This is a REQUIRED field.
-  VolumeCapability volume_capability = 5;
+  VolumeCapability volume_capability = 6;
 
   // Indicates SP MUST publish the volume in readonly mode.
   // This field is REQUIRED.
-  bool readonly = 6;
+  bool readonly = 7;
 
   // Secrets required by plugin to complete node publish volume request.
   // This field is OPTIONAL. Refer to the `Secrets Requirements`
   // section on how to use this field.
-  map<string, string> secrets = 7 [(csi_secret) = true];
+  map<string, string> secrets = 8 [(csi_secret) = true];
 
   // Volume context as returned by CO in CreateVolumeRequest. This field
   // is OPTIONAL and MUST match the volume_context of the volume
   // identified by `volume_id`.
-  map<string, string> volume_context = 8;
+  map<string, string> volume_context = 9;
 }
-
+```
+```
 message NodeCheckVolumeResponse {
-  // Indicate whether the volume is mounted
-  bool is_mounted = 1;
+  // Indicate whether the volume is attached to this node
+  bool is_attached = 1;
 
-  // Indicate whether the volume is usable
-  bool usable = 2;
+   // Indicate whether the volume is mounted
+  bool is_mounted = 2;
+
+  // describe the volume health condition
+  string health_condition = 3
 }
 ```
 
-If volume is no longer mounted, monitoring (reaction) controller can trigger the CSI plugin to re-mount. The reaction controller will not be in the scope for the first phase of the volume health proposal.
-If volume is still mounted but not compatible, it needs admin intervention. Log an event but DO NOT attempt to unmount and re-mount.
+### External controller
 
-This RPC also checks whether volume is still usable by checking if filesystem is corrupted, if there are bad blocks, etc.
+#### CSI interface
+Call ControllerCheckVolume() RPC for network storage PVs periodically to check the health condition of PVs themselves
 
+#### Node failure event
+Watch node failure event for both network and local storage. 
+If node breaks down, the attaching and mounting conditions could not be detected by external agent any more, we need to mark the PV here.
 
-### Local storage
+#### HTTP(RPC) service
+Create a HTTP(RPC) service to receive PVs health condition reports from other components. 
+Users can extend the PV health condition monitoring by setting up their own detector and report the result to the service.
 
-The local storage PV monitor should include two parts
- 
-- A daemonset on every node, which is responsible for monitoring local PVs in that specific node, no matter the PVs are created manually or by provisioner;
+### External agent
 
-- A local PV monitor controller, which is responsible for watching node failure events. The controller can be deployed as deployment with leader election mechanism.
-
-Detailed local PV monitoring method may be like:
-```
- func (mon *minitor) CheckVolumeConditions(spec *v1.PersistentVolumeSpec) (string, error) {
-            // check if PV is local storage
-    if pv.Spec.Local == nil { 
-		glog.Infof("PV: %s is not local storage", pv.Name)
-		return ...
-	}
-            // check labels and selectors
-               ...
-            // check if PV belongs to this node
-               ...
-            // check if host dir still exists
-               …
-            // check if it is still mounted
-                …
-            // check if there are bad blocks...
-}
-```
+#### CSI interface
+Call NodeCheckVolume() RPC for network storage to check the attaching and mounting conditions.
+Call both ControllerCheckVolume() and NodeCheckVolume() RPCs for local storage when local storage CSI support is enabled
+For now, check local PVs directly by the agent.
 
 
+### Simple reactions:
 
-
-### PV controller changes:
-
-For unbound PVCs/PVs,  PVCs will not be bound to tainted PVs.
-
+For unbound PVCs/PVs,  we need to prevent binding tainted PVs to PVCs.
 
 
 ## Implementation History
 
+- 20190730: KEP updated
 
 - 20190530: KEP submitted
 
 - Demo implementation (using annotations): 
 https://github.com/NickrenREN/kubemonitor/tree/master/build/kube_storage_monitor/local_monitor
 https://github.com/NickrenREN/kubemonitor/tree/master/build/kube_storage_monitor/node_watcher
-
