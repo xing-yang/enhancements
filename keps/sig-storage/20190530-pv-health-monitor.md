@@ -128,9 +128,8 @@ Container Storage Interface (CSI) specification will be modified to add two RPCs
 
 - ControllerCheckVolume RPC
   - External controller calls ControllerCheckVolume() to check the health condition of PVs themselves, for example, if the PVs are deleted ...
-  - Move Attach checking here ?
+  - If volume is attached to this node, the external controller calls ControllerCheckVolume() to see if volume is still attached.
 - NodeCheckVolume RPC
-  - If volume is attached to this node, the external agent calls NodeCheckVolume() to see if volume is still attached; Move this check to  ControllerCheckVolume ?
   - For any PV that is mounted, the external agent calls NodeCheckVolume() to see if volume is still mounted;
   - Calls NodeCheckVolume to check if volume is usable, e.g., filesystem corruption, bad blocks, etc ?
 
@@ -145,8 +144,8 @@ CSI driver also needs to implement the following CSI Node RPC if CHECK_VOLUME no
 The RPC changes needed in the CSI Spec are described in the following.
 
 ##### Add ControllerCheckVolume RPC
-ControllerCheckVolume RPC checks the health condition of PVs themselves, for example if the volume still exists,  if the usage is reaching the threshold and so on.
-Input parameters: volume_id is enough.
+ControllerCheckVolume RPC checks the health condition of PVs themselves, for example if the volume still exists, if the usage is reaching the threshold and so on. ControllerCheckVolume RPC also checks whether the volume is still attached to the node.
+
 ```
 rpc ControllerCheckVolume (ControllerCheckVolumeRequest)
     returns (ControllerCheckVolumeResponse) {}
@@ -156,6 +155,32 @@ message ControllerCheckVolumeRequest {
   // The ID of the volume to be used on a node.
   // This field is REQUIRED.
   string volume_id = 1;
+
+  // The ID of the node. This field is REQUIRED. The CO SHALL set this
+  // field to match the node ID returned by `NodeGetInfo`.
+  string node_id = 2;
+
+  // Volume capability describing how the CO intends to use this volume.
+  // SP MUST ensure the CO can use the published volume as described.
+  // Otherwise SP MUST return the appropriate gRPC error code.
+  // This is a OPTIONAL field. (REQUIRED if checking whether attached or not)
+  VolumeCapability volume_capability = 3;
+
+  // Indicates SP MUST publish the volume in readonly mode.
+  // CO MUST set this field to false if SP does not have the
+  // PUBLISH_READONLY controller capability.
+  // This is a OPTIONAL field. (REQUIRED if checking whether attached or not)
+  bool readonly = 4;
+
+  // Secrets required by plugin to complete controller publish volume
+  // request. This field is OPTIONAL. Refer to the
+  // `Secrets Requirements` section on how to use this field.
+  map<string, string> secrets = 5 [(csi_secret) = true];
+
+  // Volume context as returned by CO in CreateVolumeRequest. This field
+  // is OPTIONAL and MUST match the volume_context of the volume
+  // identified by `volume_id`.
+  map<string, string> volume_context = 6;
 }
 ```
 ```
@@ -163,11 +188,14 @@ message ControllerCheckVolumeResponse {
   // Indicate whether the volume exists
   bool exists = 1;
 
-  // Indicate the usage of the volume
-  string usage = 2;
+  // Indicate whether the volume is attached
+  bool is_attached = 2;
 
-// describe the volume health condition
-  string health_condition = 3
+  // Indicate how much free space is available on the volume
+  int64 available_capacity = 3;
+
+  // describe the volume health condition
+  string health_condition = 4;
 }
 ```
 
@@ -183,9 +211,10 @@ message NodeCheckVolumeRequest {
   // The ID of the volume to check. This field is REQUIRED.
   string volume_id = 1;
 
-// The ID of the node. This field is REQUIRED. The CO SHALL set this
+  // The ID of the node. This field is REQUIRED. The CO SHALL set this
   // field to match the node ID returned by `NodeGetInfo`.
   string node_id = 2;
+
   // The CO SHALL set this field to the value returned by
   // `ControllerPublishVolume` if the corresponding Controller Plugin
   // has `PUBLISH_UNPUBLISH_VOLUME` controller capability, and SHALL be
